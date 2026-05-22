@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hashlib
 import json
 import os
 import random
@@ -140,6 +141,23 @@ def init_db():
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_fingerprints (
+                media_hash TEXT PRIMARY KEY,
+                media_type TEXT NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                source_msg_id INTEGER NOT NULL,
+                archive_msg_id INTEGER,
+                sender_name TEXT,
+                sender_username TEXT,
+                first_seen_at TEXT NOT NULL,
+                source_created_at TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         # Safe migrations for older SQLite files already created on Render.
         for col_name, col_type in (
             ("sender_name", "TEXT"),
@@ -158,6 +176,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_created ON processed_messages (created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_error_created ON error_log (created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_created ON performance_log (created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_media_type_seen ON media_fingerprints (media_type, first_seen_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_media_source ON media_fingerprints (source_chat_id, source_msg_id)")
         conn.commit()
 
 
@@ -211,6 +231,8 @@ def media_type_from_message(message):
         return "photo"
     if getattr(message, "video", None):
         return "video"
+    if getattr(message, "video_note", None):
+        return "video_note"
     if getattr(message, "document", None):
         return "document"
     if getattr(message, "voice", None):
@@ -294,6 +316,106 @@ def get_archive_msg_id(source_chat_id, source_msg_id):
     return row["archive_msg_id"] if row else None
 
 
+def is_media_duplicate_supported(media_type):
+    return media_type in ("photo", "video", "video_note")
+
+
+async def media_hash_from_message(message, media_type):
+    """Exact duplicate detector for photos/videos/video notes.
+    It downloads only supported media and hashes bytes. This is the most reliable
+    way to detect the same media even after it is uploaded again.
+    """
+    if not is_media_duplicate_supported(media_type):
+        return None
+    try:
+        data = await asyncio.wait_for(client.download_media(message, bytes), timeout=90)
+        if not data:
+            return None
+        return hashlib.sha256(data).hexdigest()
+    except Exception as e:
+        # Fallback by Telegram media id when byte download fails.
+        try:
+            if getattr(message, "photo", None):
+                return f"photo_id:{message.photo.id}"
+            if getattr(message, "document", None):
+                return f"doc_id:{message.document.id}"
+        except Exception:
+            pass
+        log_error("MEDIA HASH ERROR", e)
+        return None
+
+
+def get_media_fingerprint(media_hash):
+    if not media_hash:
+        return None
+    with _db_lock:
+        row = conn.execute(
+            """
+            SELECT media_hash, media_type, source_chat_id, source_msg_id, archive_msg_id,
+                   sender_name, sender_username, first_seen_at, source_created_at
+            FROM media_fingerprints
+            WHERE media_hash = ?
+            """,
+            (media_hash,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "media_hash": row[0],
+        "media_type": row[1],
+        "source_chat_id": row[2],
+        "source_msg_id": row[3],
+        "archive_msg_id": row[4],
+        "sender_name": row[5],
+        "sender_username": row[6],
+        "first_seen_at": row[7],
+        "source_created_at": row[8],
+    }
+
+
+def save_media_fingerprint(media_hash, media_type, source_chat_id, source_msg_id, archive_msg_id,
+                           sender_name=None, sender_username=None, source_created_at=None):
+    if not media_hash:
+        return
+    with _db_lock:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO media_fingerprints
+            (media_hash, media_type, source_chat_id, source_msg_id, archive_msg_id,
+             sender_name, sender_username, first_seen_at, source_created_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                media_hash,
+                media_type,
+                source_chat_id,
+                source_msg_id,
+                archive_msg_id,
+                sender_name,
+                sender_username,
+                source_created_at or now_text(),
+                source_created_at,
+                now_text(),
+            ),
+        )
+        conn.commit()
+
+
+def format_media_duplicate_text(first_row):
+    sender = first_row.get("sender_name") or "Номаълум"
+    username = first_row.get("sender_username")
+    if username and f"@{username}" not in sender:
+        sender = f"{sender} (@{username})"
+    first_time = first_row.get("source_created_at") or first_row.get("first_seen_at") or "Номаълум"
+    media_type = first_row.get("media_type") or "media"
+    return (
+        f"♻️ Бу {media_type} аввал ҳам ташланган.\n"
+        f"🕒 Биринчи ташланган вақт: {first_time}\n"
+        f"👤 Биринчи ташлаган: {sender}\n"
+        f"🆔 Биринчи хабар ID: {first_row.get('source_msg_id')}"
+    )
+
+
 def is_processed(source_chat_id, source_msg_id):
     with _db_lock:
         row = conn.execute(
@@ -322,6 +444,7 @@ def get_stats():
         "server_time_tashkent": now_text(),
         "total_archived": total_archived,
         "duplicates_blocked": get_counter("duplicates_blocked"),
+        "media_duplicates_detected": get_counter("media_duplicates_detected"),
         "queued_messages": get_counter("queued_messages"),
         "forward_errors": get_counter("forward_errors"),
         "floodwaits": get_counter("floodwaits"),
@@ -518,6 +641,12 @@ async def archive_worker(worker_id, archive_input, archive_chat_id, source_chat_
             msg_text = message_text_for_db(msg)
             source_created_at = tg_time_text(getattr(msg, "date", None))
 
+            media_hash = None
+            first_media_row = None
+            if is_media_duplicate_supported(media_type):
+                media_hash = await media_hash_from_message(msg, media_type)
+                first_media_row = get_media_fingerprint(media_hash) if media_hash else None
+
             await safe_telegram_pause("forward")
             forwarded = await safe_call("forward", client.forward_messages, archive_input, msg)
             forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
@@ -532,6 +661,34 @@ async def archive_worker(worker_id, archive_input, archive_chat_id, source_chat_
                 message_text=msg_text,
                 source_created_at=source_created_at,
             )
+
+            if media_hash and not first_media_row:
+                save_media_fingerprint(
+                    media_hash,
+                    media_type,
+                    source_chat_id,
+                    source_msg_id,
+                    forwarded_msg.id,
+                    sender_name=sender_name,
+                    sender_username=sender_username,
+                    source_created_at=source_created_at,
+                )
+            elif first_media_row:
+                duplicate_text = format_media_duplicate_text(first_media_row)
+                await safe_telegram_pause("media_duplicate_audit")
+                try:
+                    await safe_call(
+                        "media_duplicate_audit",
+                        client.send_message,
+                        archive_input,
+                        duplicate_text,
+                        reply_to=forwarded_msg.id,
+                    )
+                except Exception:
+                    await safe_call("media_duplicate_audit_no_reply", client.send_message, archive_input, duplicate_text)
+                inc_counter("media_duplicates_detected", 1)
+                print(f"♻️ MEDIA DUPLICATE DETECTED: {source_msg_id} first={first_media_row.get('source_msg_id')}", flush=True)
+
             runtime_state["last_forward_at"] = now_text()
             inc_counter("archived", 1)
             print(f"✅ WORKER {worker_id}: FORWARDED {source_msg_id} -> {forwarded_msg.id} [{media_type}]", flush=True)
@@ -569,6 +726,7 @@ async def start_monitor_once():
     print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
     print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
     print("ℹ️ DELETE SYNC: OFF — асосий гуруҳдан ўчса ҳам архивдан ўчмайди", flush=True)
+    print("ℹ️ MEDIA DUPLICATE: photo/video/video_note қайта ташланса, биринчи ташланган вақт reply қилинади", flush=True)
     print("ℹ️ TIME MODE: FORCE Asia/Tashkent UTC+5", flush=True)
     print(f"🛡 SAFE LIMIT: each send {SEND_DELAY_MIN}-{SEND_DELAY_MAX}s, every {BURST_LIMIT} sends cooldown {BURST_PAUSE_SECONDS}s", flush=True)
 
