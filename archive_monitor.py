@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -26,6 +27,12 @@ QUEUE_WORKERS = int(os.environ.get("QUEUE_WORKERS", "2"))
 QUEUE_MAXSIZE = int(os.environ.get("QUEUE_MAXSIZE", "5000"))
 TASHKENT_TZ = timezone(timedelta(hours=5), name="Asia/Tashkent")
 
+# Telegram anti-ban safe limits
+SEND_DELAY_MIN = float(os.environ.get("SEND_DELAY_MIN", "0.8"))
+SEND_DELAY_MAX = float(os.environ.get("SEND_DELAY_MAX", "1.5"))
+BURST_LIMIT = int(os.environ.get("BURST_LIMIT", "20"))
+BURST_PAUSE_SECONDS = float(os.environ.get("BURST_PAUSE_SECONDS", "3"))
+
 # IMPORTANT: archive group messages will NOT be deleted if source messages are deleted.
 DELETE_SYNC_ENABLED = False
 
@@ -42,6 +49,8 @@ runtime_state = {
     "last_error": None,
     "queue_size": 0,
     "workers": QUEUE_WORKERS,
+    "safe_sent_count": 0,
+    "last_safe_pause_at": None,
 }
 
 # ================= SQLITE DATABASE =================
@@ -54,6 +63,8 @@ def db_connect():
     return conn
 
 conn = db_connect()
+safe_limit_lock = asyncio.Lock()
+safe_sent_count = 0
 
 
 def now_text():
@@ -80,6 +91,10 @@ def init_db():
                 archive_chat_id INTEGER NOT NULL,
                 archive_msg_id INTEGER NOT NULL,
                 media_type TEXT,
+                sender_name TEXT,
+                sender_username TEXT,
+                message_text TEXT,
+                source_created_at TEXT,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_msg_id)
             )
@@ -124,6 +139,18 @@ def init_db():
             )
             """
         )
+
+        # Safe migrations for older SQLite files already created on Render.
+        for col_name, col_type in (
+            ("sender_name", "TEXT"),
+            ("sender_username", "TEXT"),
+            ("message_text", "TEXT"),
+            ("source_created_at", "TEXT"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE message_map ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass
 
         # Advanced indexes for speed on big archives.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_map_archive ON message_map (archive_chat_id, archive_msg_id)")
@@ -197,15 +224,37 @@ def media_type_from_message(message):
     return "text"
 
 
-def save_map(source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, media_type):
+def save_map(
+    source_chat_id,
+    source_msg_id,
+    archive_chat_id,
+    archive_msg_id,
+    media_type,
+    sender_name=None,
+    sender_username=None,
+    message_text=None,
+    source_created_at=None,
+):
     with _db_lock:
         conn.execute(
             """
             INSERT OR REPLACE INTO message_map
-            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, media_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, media_type,
+             sender_name, sender_username, message_text, source_created_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, media_type, now_text()),
+            (
+                source_chat_id,
+                source_msg_id,
+                archive_chat_id,
+                archive_msg_id,
+                media_type,
+                sender_name,
+                sender_username,
+                message_text,
+                source_created_at,
+                now_text(),
+            ),
         )
         conn.execute(
             """
@@ -218,13 +267,31 @@ def save_map(source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, med
         conn.commit()
 
 
-def get_archive_msg_id(source_chat_id, source_msg_id):
+def get_map_row(source_chat_id, source_msg_id):
     with _db_lock:
         row = conn.execute(
-            "SELECT archive_msg_id FROM message_map WHERE source_chat_id = ? AND source_msg_id = ?",
+            """
+            SELECT archive_msg_id, media_type, sender_name, sender_username, message_text, source_created_at
+            FROM message_map
+            WHERE source_chat_id = ? AND source_msg_id = ?
+            """,
             (source_chat_id, source_msg_id),
         ).fetchone()
-    return row[0] if row else None
+    if not row:
+        return None
+    return {
+        "archive_msg_id": row[0],
+        "media_type": row[1],
+        "sender_name": row[2],
+        "sender_username": row[3],
+        "message_text": row[4],
+        "source_created_at": row[5],
+    }
+
+
+def get_archive_msg_id(source_chat_id, source_msg_id):
+    row = get_map_row(source_chat_id, source_msg_id)
+    return row["archive_msg_id"] if row else None
 
 
 def is_processed(source_chat_id, source_msg_id):
@@ -263,6 +330,8 @@ def get_stats():
         "avg_forward_ms": int(avg_perf),
         "last_event_at": runtime_state.get("last_event_at"),
         "last_forward_at": runtime_state.get("last_forward_at"),
+        "safe_sent_count": runtime_state.get("safe_sent_count"),
+        "last_safe_pause_at": runtime_state.get("last_safe_pause_at"),
         "last_error": runtime_state.get("last_error"),
     }
 
@@ -322,6 +391,56 @@ async def safe_call(place, func, *args, retries=5, **kwargs):
             await asyncio.sleep(min(5 * attempt, 45))
 
 
+async def safe_telegram_pause(reason="send"):
+    """Global anti-ban limiter: small random delay + 3s cooldown after every 20 Telegram sends."""
+    global safe_sent_count
+    async with safe_limit_lock:
+        safe_sent_count += 1
+        runtime_state["safe_sent_count"] = safe_sent_count
+
+        delay = random.uniform(SEND_DELAY_MIN, SEND_DELAY_MAX)
+        await asyncio.sleep(delay)
+
+        if BURST_LIMIT > 0 and safe_sent_count % BURST_LIMIT == 0:
+            runtime_state["last_safe_pause_at"] = now_text()
+            print(
+                f"🛡 SAFE MODE: {BURST_LIMIT} Telegram sends done → cooldown {BURST_PAUSE_SECONDS}s | reason={reason}",
+                flush=True,
+            )
+            await asyncio.sleep(BURST_PAUSE_SECONDS)
+
+
+def message_text_for_db(msg):
+    text = msg.message or msg.text or msg.raw_text or ""
+    if text:
+        return text[:4000]
+    if msg.media:
+        return f"[{media_type_from_message(msg)} media/caption йўқ]"
+    return "[матнсиз хабар]"
+
+
+def sender_username_raw(user):
+    return getattr(user, "username", None) if user else None
+
+
+def format_deleted_original(row):
+    if not row:
+        return "⚠️ Ўчирилган хабар маълумоти database mapping’да топилмади. Бу хабар архив monitor ишламасидан олдин архивланган бўлиши мумкин."
+    text = row.get("message_text") or "[матнсиз/media хабар]"
+    sender = row.get("sender_name") or "Номаълум"
+    if row.get("sender_username") and "@" not in sender:
+        sender = f"{sender} (@{row.get('sender_username')})"
+    source_created = row.get("source_created_at") or "Номаълум"
+    media_type = row.get("media_type") or "unknown"
+    return (
+        f"📌 Ўчирилган хабар маълумоти:\n"
+        f"👤 Ёзган: {sender}\n"
+        f"🕒 Ёзилган вақт: {source_created}\n"
+        f"📎 Тур: {media_type}\n\n"
+        f"💬 Хабар:\n{text}"
+    )
+
+
 def sender_name_from_user(user):
     if not user:
         return "Номаълум"
@@ -366,7 +485,8 @@ async def find_dialog_by_id_or_title(group_id, title_hint=None):
 
 
 async def verify_can_send(archive_input):
-    test_text = "✅ Archive monitor stability test: archive peer ишлаяпти"
+    test_text = "✅ Archive monitor PRO SAFE LIMIT test: archive peer ишлаяпти"
+    await safe_telegram_pause("archive_test_send")
     msg = await safe_call("archive_test_send", client.send_message, archive_input, test_text)
     print(f"✅ ARCHIVE TEST SEND OK: msg_id={msg.id}", flush=True)
     try:
@@ -392,9 +512,26 @@ async def archive_worker(worker_id, archive_input, archive_chat_id, source_chat_
                 print(f"♻️ DUPLICATE SKIPPED: {source_msg_id}", flush=True)
                 continue
 
+            sender = await event.get_sender()
+            sender_name = sender_name_from_user(sender)
+            sender_username = sender_username_raw(sender)
+            msg_text = message_text_for_db(msg)
+            source_created_at = tg_time_text(getattr(msg, "date", None))
+
+            await safe_telegram_pause("forward")
             forwarded = await safe_call("forward", client.forward_messages, archive_input, msg)
             forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
-            save_map(source_chat_id, source_msg_id, archive_chat_id, forwarded_msg.id, media_type)
+            save_map(
+                source_chat_id,
+                source_msg_id,
+                archive_chat_id,
+                forwarded_msg.id,
+                media_type,
+                sender_name=sender_name,
+                sender_username=sender_username,
+                message_text=msg_text,
+                source_created_at=source_created_at,
+            )
             runtime_state["last_forward_at"] = now_text()
             inc_counter("archived", 1)
             print(f"✅ WORKER {worker_id}: FORWARDED {source_msg_id} -> {forwarded_msg.id} [{media_type}]", flush=True)
@@ -427,12 +564,13 @@ async def start_monitor_once():
     runtime_state["source"] = str(getattr(source_entity, "title", SOURCE_GROUP))
     runtime_state["archive"] = str(getattr(archive_entity, "title", ARCHIVE_GROUP))
 
-    print("✅ Archive monitor STABILITY ONLY TASHKENT FIXED started", flush=True)
+    print("✅ Archive monitor PRO SAFE LIMIT started", flush=True)
     print(f"✅ TASHKENT TIME NOW: {now_text()}", flush=True)
     print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
     print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
     print("ℹ️ DELETE SYNC: OFF — асосий гуруҳдан ўчса ҳам архивдан ўчмайди", flush=True)
     print("ℹ️ TIME MODE: FORCE Asia/Tashkent UTC+5", flush=True)
+    print(f"🛡 SAFE LIMIT: each send {SEND_DELAY_MIN}-{SEND_DELAY_MAX}s, every {BURST_LIMIT} sends cooldown {BURST_PAUSE_SECONDS}s", flush=True)
 
     await verify_can_send(archive_input)
 
@@ -476,6 +614,7 @@ async def start_monitor_once():
                 f"👤 Таҳрирлаган: {sender_name}\n\n"
                 f"🆕 Янги маълумот:\n{new_text}"
             )
+            await safe_telegram_pause("edit_audit")
             await safe_call("edit_audit", client.send_message, archive_input, audit_text, reply_to=archive_message_id)
             inc_counter("edit_audits", 1)
             print(f"✅ Edited audit sent: {original_id}", flush=True)
@@ -484,10 +623,47 @@ async def start_monitor_once():
         finally:
             log_perf("edited_message", started)
 
+    async def deleted_message(event):
+        """Send delete audit alert only. Archive copy is NOT deleted."""
+        started = time.perf_counter()
+        try:
+            deleted_ids = list(getattr(event, "deleted_ids", []) or [])
+            if not deleted_ids:
+                return
+
+            for deleted_id in deleted_ids:
+                row = get_map_row(source_chat_id, deleted_id)
+                original_info = format_deleted_original(row)
+                audit_text = (
+                    f"🗑 Маълумот ўчирилди\n"
+                    f"🕒 Вақт: {now_text()}\n"
+                    f"👤 Ўчирган: Telegram delete event — аниқ user’ни Telegram API ҳар доим бермайди\n"
+                    f"🆔 Source msg_id: {deleted_id}\n\n"
+                    f"{original_info}\n\n"
+                    f"ℹ️ Архивдаги нусха ўчирилмади."
+                )
+
+                reply_to = row.get("archive_msg_id") if row else None
+                await safe_telegram_pause("delete_audit")
+                if reply_to:
+                    try:
+                        await safe_call("delete_audit", client.send_message, archive_input, audit_text, reply_to=reply_to)
+                    except Exception:
+                        await safe_call("delete_audit_no_reply", client.send_message, archive_input, audit_text)
+                else:
+                    await safe_call("delete_audit_no_map", client.send_message, archive_input, audit_text)
+                inc_counter("delete_audits", 1)
+                print(f"✅ Delete audit sent, archive copy kept: {deleted_id}", flush=True)
+        except Exception as e:
+            log_error("DELETE AUDIT ERROR", e)
+        finally:
+            log_perf("deleted_message", started)
+
     client.add_event_handler(enqueue_new_message, events.NewMessage(chats=source_input))
     client.add_event_handler(edited_message, events.MessageEdited(chats=source_input))
+    client.add_event_handler(deleted_message, events.MessageDeleted(chats=source_input))
 
-    # No delete-sync handler is registered by design.
+    # Delete-sync is OFF by design: source delete => archive copy stays, only audit alert is sent.
     runtime_state["status"] = "running"
     print("✅ Monitor active. SOURCE группага янги хабар ташлаб текширинг.", flush=True)
     await client.run_until_disconnected()
