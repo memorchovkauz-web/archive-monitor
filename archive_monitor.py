@@ -1,99 +1,64 @@
 import asyncio
+import gc
+import json
 import os
 import sqlite3
 import threading
+import time
 import traceback
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
-from telethon.tl.types import ChannelAdminLogEventActionDeleteMessage
 
 # ================= CONFIG =================
 api_id = 36784553
 api_hash = "c463b506e987f1f82e211cef8c50f952"
 
-# 1 ta yoki ko'p gruppa monitoring uchun.
-# Hozir sizdagi ishlayotgan juftlik saqlab qolindi.
-# Keyin yangi gruppa qo'shish uchun shu listga yangi dict qo'shiladi.
-MONITOR_PAIRS = [
-    {
-        "name": "Техника",
-        "source_group": -1003172289496,
-        "archive_group": -5281572843,
-        "archive_title_hint": "Техника Архив",
-    },
-]
+SOURCE_GROUP = -1003172289496
+ARCHIVE_GROUP = -5281572843
+ARCHIVE_TITLE_HINT = "Техника Архив"
 
 SESSION_NAME = os.environ.get("SESSION_NAME", "archive_monitor")
 DB_NAME = os.environ.get("DB_NAME", "archive_map.db")
+QUEUE_WORKERS = int(os.environ.get("QUEUE_WORKERS", "2"))
+QUEUE_MAXSIZE = int(os.environ.get("QUEUE_MAXSIZE", "5000"))
+LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TZ", "Asia/Tashkent"))
+
+# IMPORTANT: archive group messages will NOT be deleted if source messages are deleted.
+DELETE_SYNC_ENABLED = False
 
 client = TelegramClient(SESSION_NAME, api_id, api_hash)
 _db_lock = threading.Lock()
-_runtime_stats = {
-    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "forwarded": 0,
-    "duplicates": 0,
-    "edits": 0,
-    "delete_audits": 0,
-    "errors": 0,
+start_time = time.time()
+archive_queue = None
+runtime_state = {
+    "status": "starting",
+    "source": None,
+    "archive": None,
+    "last_event_at": None,
+    "last_forward_at": None,
+    "last_error": None,
+    "queue_size": 0,
+    "workers": QUEUE_WORKERS,
 }
-
-
-# ================= RENDER KEEP-ALIVE HTTP SERVER =================
-class HealthHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        return
-
-    def _send(self, code=200, body=b"OK", content_type="text/plain; charset=utf-8"):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path in ("/", "/health", "/ping"):
-            self._send(200, b"Archive monitor is running")
-        elif self.path == "/stats":
-            body = (
-                "Archive monitor PRO v2\n"
-                f"started_at={_runtime_stats['started_at']}\n"
-                f"forwarded={_runtime_stats['forwarded']}\n"
-                f"duplicates={_runtime_stats['duplicates']}\n"
-                f"edits={_runtime_stats['edits']}\n"
-                f"delete_audits={_runtime_stats['delete_audits']}\n"
-                f"errors={_runtime_stats['errors']}\n"
-            ).encode("utf-8")
-            self._send(200, body)
-        else:
-            self._send(200, b"OK")
-
-    def do_HEAD(self):
-        self._send(200, b"")
-
-
-def run_keep_alive_server():
-    port = int(os.environ.get("PORT", "10000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"✅ KEEP ALIVE SERVER STARTED ON PORT {port}", flush=True)
-    server.serve_forever()
-
-
-threading.Thread(target=run_keep_alive_server, daemon=True).start()
-
 
 # ================= SQLITE DATABASE =================
 def db_connect():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
-
 conn = db_connect()
+
+
+def now_text():
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db():
@@ -105,7 +70,7 @@ def init_db():
                 source_msg_id INTEGER NOT NULL,
                 archive_chat_id INTEGER NOT NULL,
                 archive_msg_id INTEGER NOT NULL,
-                pair_name TEXT,
+                media_type TEXT,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_msg_id)
             )
@@ -116,21 +81,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS processed_messages (
                 source_chat_id INTEGER NOT NULL,
                 source_msg_id INTEGER NOT NULL,
-                pair_name TEXT,
                 created_at TEXT NOT NULL,
-                PRIMARY KEY (source_chat_id, source_msg_id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS delete_audit (
-                source_chat_id INTEGER NOT NULL,
-                source_msg_id INTEGER NOT NULL,
-                archive_msg_id INTEGER,
-                pair_name TEXT,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_msg_id)
             )
             """
@@ -147,52 +98,54 @@ def init_db():
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS archive_stats (
-                day TEXT NOT NULL,
-                pair_name TEXT NOT NULL,
-                forwarded_count INTEGER NOT NULL DEFAULT 0,
-                duplicate_count INTEGER NOT NULL DEFAULT 0,
-                edit_count INTEGER NOT NULL DEFAULT 0,
-                delete_audit_count INTEGER NOT NULL DEFAULT 0,
-                error_count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (day, pair_name)
+            CREATE TABLE IF NOT EXISTS performance_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                place TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                queue_size INTEGER NOT NULL
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS counters (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        # Advanced indexes for speed on big archives.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_map_archive ON message_map (archive_chat_id, archive_msg_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_map_created ON message_map (created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_created ON processed_messages (created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_error_created ON error_log (created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_created ON performance_log (created_at)")
         conn.commit()
 
 
-def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def today_text():
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-def bump_stat(pair_name, column):
-    allowed = {"forwarded_count", "duplicate_count", "edit_count", "delete_audit_count", "error_count"}
-    if column not in allowed:
-        return
+def inc_counter(key, amount=1):
     with _db_lock:
         conn.execute(
             """
-            INSERT OR IGNORE INTO archive_stats (day, pair_name)
-            VALUES (?, ?)
+            INSERT INTO counters (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
             """,
-            (today_text(), pair_name),
-        )
-        conn.execute(
-            f"UPDATE archive_stats SET {column} = {column} + 1 WHERE day = ? AND pair_name = ?",
-            (today_text(), pair_name),
+            (key, amount),
         )
         conn.commit()
 
 
-def log_error(place, error, pair_name="system"):
-    _runtime_stats["errors"] += 1
-    bump_stat(pair_name, "error_count")
+def get_counter(key):
+    with _db_lock:
+        row = conn.execute("SELECT value FROM counters WHERE key = ?", (key,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def log_error(place, error):
     text = repr(error)
+    runtime_state["last_error"] = f"{place}: {text}"
     print(f"❌ {place}: {text}", flush=True)
     with _db_lock:
         conn.execute(
@@ -200,25 +153,58 @@ def log_error(place, error, pair_name="system"):
             (now_text(), place, text),
         )
         conn.commit()
+    inc_counter("errors", 1)
 
 
-def save_map(pair_name, source_chat_id, source_msg_id, archive_chat_id, archive_msg_id):
+def log_perf(place, started_at):
+    duration_ms = int((time.perf_counter() - started_at) * 1000)
+    qsize = archive_queue.qsize() if archive_queue else 0
+    runtime_state["queue_size"] = qsize
+    if duration_ms >= 500 or place in ("forward", "edit_audit"):
+        print(f"⚡ PERF {place}: {duration_ms}ms | queue={qsize}", flush=True)
+    with _db_lock:
+        conn.execute(
+            "INSERT INTO performance_log (created_at, place, duration_ms, queue_size) VALUES (?, ?, ?, ?)",
+            (now_text(), place, duration_ms, qsize),
+        )
+        conn.commit()
+
+
+def media_type_from_message(message):
+    if getattr(message, "photo", None):
+        return "photo"
+    if getattr(message, "video", None):
+        return "video"
+    if getattr(message, "document", None):
+        return "document"
+    if getattr(message, "voice", None):
+        return "voice"
+    if getattr(message, "audio", None):
+        return "audio"
+    if getattr(message, "sticker", None):
+        return "sticker"
+    if getattr(message, "media", None):
+        return "media"
+    return "text"
+
+
+def save_map(source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, media_type):
     with _db_lock:
         conn.execute(
             """
             INSERT OR REPLACE INTO message_map
-            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, pair_name, created_at)
+            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, media_type, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, pair_name, now_text()),
+            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, media_type, now_text()),
         )
         conn.execute(
             """
             INSERT OR IGNORE INTO processed_messages
-            (source_chat_id, source_msg_id, pair_name, created_at)
-            VALUES (?, ?, ?, ?)
+            (source_chat_id, source_msg_id, created_at)
+            VALUES (?, ?, ?)
             """,
-            (source_chat_id, source_msg_id, pair_name, now_text()),
+            (source_chat_id, source_msg_id, now_text()),
         )
         conn.commit()
 
@@ -241,38 +227,88 @@ def is_processed(source_chat_id, source_msg_id):
     return row is not None
 
 
-def save_delete_audit(pair_name, source_chat_id, source_msg_id, archive_msg_id, status):
+def get_stats():
     with _db_lock:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO delete_audit
-            (source_chat_id, source_msg_id, archive_msg_id, pair_name, created_at, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (source_chat_id, source_msg_id, archive_msg_id, pair_name, now_text(), status),
-        )
-        conn.commit()
+        total_archived = conn.execute("SELECT COUNT(*) FROM message_map").fetchone()[0]
+        total_errors = conn.execute("SELECT COUNT(*) FROM error_log").fetchone()[0]
+        by_media = dict(conn.execute("SELECT COALESCE(media_type, 'unknown'), COUNT(*) FROM message_map GROUP BY media_type").fetchall())
+        avg_perf = conn.execute("SELECT COALESCE(AVG(duration_ms), 0) FROM performance_log WHERE place = 'forward'").fetchone()[0]
+    uptime_seconds = int(time.time() - start_time)
+    return {
+        "status": runtime_state.get("status"),
+        "uptime_seconds": uptime_seconds,
+        "queue_size": archive_queue.qsize() if archive_queue else 0,
+        "workers": QUEUE_WORKERS,
+        "source_group": SOURCE_GROUP,
+        "archive_group": ARCHIVE_GROUP,
+        "delete_sync_enabled": DELETE_SYNC_ENABLED,
+        "total_archived": total_archived,
+        "duplicates_blocked": get_counter("duplicates_blocked"),
+        "queued_messages": get_counter("queued_messages"),
+        "forward_errors": get_counter("forward_errors"),
+        "floodwaits": get_counter("floodwaits"),
+        "total_errors": total_errors,
+        "media": by_media,
+        "avg_forward_ms": int(avg_perf),
+        "last_event_at": runtime_state.get("last_event_at"),
+        "last_forward_at": runtime_state.get("last_forward_at"),
+        "last_error": runtime_state.get("last_error"),
+    }
 
+# ================= RENDER KEEP-ALIVE / JSON API =================
+class HealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def _send(self, status=200, body=b"OK", content_type="text/plain; charset=utf-8"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/ping"):
+            self._send(200, b"Archive monitor is running")
+        elif self.path in ("/live", "/stats"):
+            body = json.dumps(get_stats(), ensure_ascii=False, indent=2).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+        else:
+            self._send(404, b"Not found")
+
+    def do_HEAD(self):
+        self._send(200, b"")
+
+
+def run_keep_alive_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"✅ KEEP ALIVE SERVER STARTED ON PORT {port}", flush=True)
+    server.serve_forever()
 
 # ================= SAFE TELEGRAM HELPERS =================
-async def safe_call(place, func, *args, retries=3, pair_name="system", **kwargs):
+async def safe_call(place, func, *args, retries=5, **kwargs):
     for attempt in range(1, retries + 1):
+        started = time.perf_counter()
         try:
-            return await func(*args, **kwargs)
+            result = await func(*args, **kwargs)
+            log_perf(place, started)
+            return result
         except FloodWaitError as e:
+            inc_counter("floodwaits", 1)
             wait_seconds = int(getattr(e, "seconds", 30)) + 2
             print(f"⏳ FLOODWAIT at {place}: waiting {wait_seconds}s", flush=True)
             await asyncio.sleep(wait_seconds)
         except (ConnectionError, TimeoutError, RPCError) as e:
-            log_error(f"{place} attempt {attempt}/{retries}", e, pair_name=pair_name)
+            log_error(f"{place} attempt {attempt}/{retries}", e)
             if attempt == retries:
                 raise
-            await asyncio.sleep(min(5 * attempt, 30))
+            await asyncio.sleep(min(5 * attempt, 45))
         except Exception as e:
-            log_error(f"{place} attempt {attempt}/{retries}", e, pair_name=pair_name)
+            log_error(f"{place} attempt {attempt}/{retries}", e)
             if attempt == retries:
                 raise
-            await asyncio.sleep(min(5 * attempt, 30))
+            await asyncio.sleep(min(5 * attempt, 45))
 
 
 def sender_name_from_user(user):
@@ -282,14 +318,11 @@ def sender_name_from_user(user):
     last = getattr(user, "last_name", None) or ""
     username = getattr(user, "username", None) or ""
     name = f"{first} {last}".strip() or "Номаълум"
-    if username:
-        name = f"{name} (@{username})"
-    return name
+    return f"{name} (@{username})" if username else name
 
 
-async def find_dialog_by_id_or_title(group_id, title_hint=None, pair_name="system"):
+async def find_dialog_by_id_or_title(group_id, title_hint=None):
     found_dialog = None
-
     async for dialog in client.iter_dialogs(limit=None):
         if dialog.id == group_id:
             found_dialog = dialog
@@ -299,135 +332,123 @@ async def find_dialog_by_id_or_title(group_id, title_hint=None, pair_name="syste
             break
 
     if not found_dialog:
-        raise RuntimeError(f"Dialog topilmadi: {group_id}")
+        raise RuntimeError(f"Dialog топилмади: {group_id}")
 
     entity = found_dialog.entity
     input_entity = found_dialog.input_entity
-
-    print(f"✅ [{pair_name}] Dialog топилди: {found_dialog.name} | dialog_id={found_dialog.id}", flush=True)
+    print(f"✅ Dialog топилди: {found_dialog.name} | dialog_id={found_dialog.id}", flush=True)
     print(f"   entity_type={type(entity).__name__} | input_type={type(input_entity).__name__}", flush=True)
 
     migrated_to = getattr(entity, "migrated_to", None)
     if migrated_to:
-        print(f"🔁 [{pair_name}] Эски Chat supergroup/channel га migrate бўлган. Янги peer ишлатилади.", flush=True)
-        migrated_entity = await safe_call("get migrated entity", client.get_entity, migrated_to, pair_name=pair_name)
-        migrated_input_entity = await safe_call("get migrated input", client.get_input_entity, migrated_entity, pair_name=pair_name)
+        print("🔁 Эски Chat supergroup/channel га migrate бўлган. Янги peer ишлатилади.", flush=True)
+        migrated_entity = await safe_call("get migrated entity", client.get_entity, migrated_to)
+        migrated_input_entity = await safe_call("get migrated input", client.get_input_entity, migrated_entity)
         print(
-            f"✅ [{pair_name}] MIGRATED TARGET: {getattr(migrated_entity, 'title', 'unknown')} | "
+            f"✅ MIGRATED TARGET: {getattr(migrated_entity, 'title', 'unknown')} | "
             f"id={getattr(migrated_entity, 'id', None)} | input_type={type(migrated_input_entity).__name__}",
             flush=True,
         )
-        return migrated_input_entity, migrated_entity, found_dialog.id
+        return migrated_input_entity, migrated_entity, found_dialog
 
-    return input_entity, entity, found_dialog.id
+    return input_entity, entity, found_dialog
 
 
-async def verify_can_send(pair_name, archive_input):
-    test_text = f"✅ Archive monitor PRO v2 test: {pair_name} archive peer ишлаяпти"
-    msg = await safe_call("archive test send", client.send_message, archive_input, test_text, pair_name=pair_name)
-    print(f"✅ [{pair_name}] ARCHIVE TEST SEND OK: msg_id={msg.id}", flush=True)
+async def verify_can_send(archive_input):
+    test_text = "✅ Archive monitor stability test: archive peer ишлаяпти"
+    msg = await safe_call("archive_test_send", client.send_message, archive_input, test_text)
+    print(f"✅ ARCHIVE TEST SEND OK: msg_id={msg.id}", flush=True)
     try:
-        await safe_call("archive test delete", client.delete_messages, archive_input, [msg.id], pair_name=pair_name)
-        print(f"✅ [{pair_name}] ARCHIVE TEST MESSAGE DELETED", flush=True)
+        await safe_call("archive_test_delete", client.delete_messages, archive_input, [msg.id])
+        print("✅ ARCHIVE TEST MESSAGE DELETED", flush=True)
     except Exception as e:
-        print(f"⚠️ [{pair_name}] Test хабарни ўчира олмадим, лекин юбориш ишлади: {e!r}", flush=True)
+        print(f"⚠️ Test хабарни ўчира олмадим, лекин юбориш ишлади: {e!r}", flush=True)
     return True
 
+# ================= ARCHIVE QUEUE / ASYNC WORKERS =================
+async def archive_worker(worker_id, archive_input, archive_chat_id, source_chat_id):
+    print(f"✅ Archive worker #{worker_id} started", flush=True)
+    while True:
+        event = await archive_queue.get()
+        started = time.perf_counter()
+        try:
+            msg = event.message
+            source_msg_id = msg.id
+            media_type = media_type_from_message(msg)
+
+            if is_processed(source_chat_id, source_msg_id):
+                inc_counter("duplicates_blocked", 1)
+                print(f"♻️ DUPLICATE SKIPPED: {source_msg_id}", flush=True)
+                continue
+
+            forwarded = await safe_call("forward", client.forward_messages, archive_input, msg)
+            forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
+            save_map(source_chat_id, source_msg_id, archive_chat_id, forwarded_msg.id, media_type)
+            runtime_state["last_forward_at"] = now_text()
+            inc_counter("archived", 1)
+            print(f"✅ WORKER {worker_id}: FORWARDED {source_msg_id} -> {forwarded_msg.id} [{media_type}]", flush=True)
+
+        except Exception as e:
+            inc_counter("forward_errors", 1)
+            log_error(f"WORKER {worker_id} FORWARD ERROR", e)
+        finally:
+            log_perf("worker_total", started)
+            archive_queue.task_done()
+            # Memory optimization: clean references after each task.
+            del event
+            if get_counter("archived") % 100 == 0:
+                gc.collect()
 
 # ================= MONITOR LOGIC =================
-async def check_deleted_messages(pair_name, source_input, source_chat_id, archive_input):
-    while True:
+async def start_monitor_once():
+    global archive_queue
+    runtime_state["status"] = "connecting"
+    await client.start()
+    init_db()
+
+    archive_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+
+    source_input, source_entity, _ = await find_dialog_by_id_or_title(SOURCE_GROUP)
+    archive_input, archive_entity, _ = await find_dialog_by_id_or_title(ARCHIVE_GROUP, title_hint=ARCHIVE_TITLE_HINT)
+
+    source_chat_id = SOURCE_GROUP
+    archive_chat_id = ARCHIVE_GROUP
+    runtime_state["source"] = str(getattr(source_entity, "title", SOURCE_GROUP))
+    runtime_state["archive"] = str(getattr(archive_entity, "title", ARCHIVE_GROUP))
+
+    print("✅ Archive monitor STABILITY ONLY started", flush=True)
+    print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
+    print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
+    print("ℹ️ DELETE SYNC: OFF — асосий гуруҳдан ўчса ҳам архивдан ўчмайди", flush=True)
+
+    await verify_can_send(archive_input)
+
+    for i in range(QUEUE_WORKERS):
+        asyncio.create_task(archive_worker(i + 1, archive_input, archive_chat_id, source_chat_id))
+
+    async def enqueue_new_message(event):
         try:
-            async for log_event in client.iter_admin_log(source_input, delete=True, limit=50):
-                if not isinstance(log_event.action, ChannelAdminLogEventActionDeleteMessage):
-                    continue
-
-                deleted_msg = log_event.action.message
-                source_msg_id = deleted_msg.id
-
-                with _db_lock:
-                    exists = conn.execute(
-                        "SELECT 1 FROM delete_audit WHERE source_chat_id = ? AND source_msg_id = ?",
-                        (source_chat_id, source_msg_id),
-                    ).fetchone()
-                if exists:
-                    continue
-
-                archive_message_id = get_archive_msg_id(source_chat_id, source_msg_id)
-                if not archive_message_id:
-                    print(f"[{pair_name}] DELETE SKIPPED, mapping not found: {source_msg_id}", flush=True)
-                    save_delete_audit(pair_name, source_chat_id, source_msg_id, None, "mapping_not_found")
-                    continue
-
-                user_name = sender_name_from_user(log_event.user)
-                await safe_call(
-                    "delete audit send",
-                    client.send_message,
-                    archive_input,
-                    f"🗑 Маълумот ўчирилди\n"
-                    f"📂 Группа: {pair_name}\n"
-                    f"🕒 Вақт: {now_text()}\n"
-                    f"👤 Ўчирган: {user_name}",
-                    reply_to=archive_message_id,
-                    pair_name=pair_name,
-                )
-                save_delete_audit(pair_name, source_chat_id, source_msg_id, archive_message_id, "audit_sent")
-                _runtime_stats["delete_audits"] += 1
-                bump_stat(pair_name, "delete_audit_count")
-                print(f"✅ [{pair_name}] Deleted audit sent: {source_msg_id}", flush=True)
-
-        except FloodWaitError as e:
-            wait_seconds = int(getattr(e, "seconds", 30)) + 2
-            print(f"⏳ [{pair_name}] DELETE FLOODWAIT: waiting {wait_seconds}s", flush=True)
-            await asyncio.sleep(wait_seconds)
-        except Exception as e:
-            log_error(f"[{pair_name}] DELETE LOOP ERROR", e, pair_name=pair_name)
-            await asyncio.sleep(10)
-
-        await asyncio.sleep(5)
-
-
-async def setup_pair(pair):
-    pair_name = pair["name"]
-    source_input, source_entity, source_dialog_id = await find_dialog_by_id_or_title(
-        pair["source_group"], pair_name=pair_name
-    )
-    archive_input, archive_entity, archive_dialog_id = await find_dialog_by_id_or_title(
-        pair["archive_group"], title_hint=pair.get("archive_title_hint"), pair_name=pair_name
-    )
-
-    await verify_can_send(pair_name, archive_input)
-
-    async def forward_message(event, pair_name=pair_name, source_chat_id=source_dialog_id, archive_chat_id=archive_dialog_id, archive_input=archive_input):
-        try:
+            runtime_state["last_event_at"] = now_text()
             source_msg_id = event.message.id
             if is_processed(source_chat_id, source_msg_id):
-                _runtime_stats["duplicates"] += 1
-                bump_stat(pair_name, "duplicate_count")
-                print(f"♻️ [{pair_name}] DUPLICATE SKIPPED: {source_msg_id}", flush=True)
+                inc_counter("duplicates_blocked", 1)
+                print(f"♻️ DUPLICATE BEFORE QUEUE SKIPPED: {source_msg_id}", flush=True)
                 return
 
-            forwarded = await safe_call(
-                "forward message",
-                client.forward_messages,
-                archive_input,
-                event.message,
-                pair_name=pair_name,
-            )
-            forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
-            save_map(pair_name, source_chat_id, source_msg_id, archive_chat_id, forwarded_msg.id)
-            _runtime_stats["forwarded"] += 1
-            bump_stat(pair_name, "forwarded_count")
-            print(f"✅ [{pair_name}] FORWARDED AND MAPPED: {source_msg_id} -> {forwarded_msg.id}", flush=True)
+            await archive_queue.put(event)
+            inc_counter("queued_messages", 1)
+            runtime_state["queue_size"] = archive_queue.qsize()
+            print(f"📥 QUEUED: {source_msg_id} | queue={archive_queue.qsize()}", flush=True)
         except Exception as e:
-            log_error(f"[{pair_name}] FORWARD ERROR", e, pair_name=pair_name)
+            log_error("QUEUE ERROR", e)
 
-    async def edited_message(event, pair_name=pair_name, source_chat_id=source_dialog_id, archive_input=archive_input):
+    async def edited_message(event):
+        started = time.perf_counter()
         try:
             original_id = event.message.id
             archive_message_id = get_archive_msg_id(source_chat_id, original_id)
             if not archive_message_id:
-                print(f"[{pair_name}] EDIT SKIPPED, mapping not found: {original_id}", flush=True)
+                print(f"EDIT SKIPPED, mapping not found: {original_id}", flush=True)
                 return
 
             sender = await event.get_sender()
@@ -438,57 +459,48 @@ async def setup_pair(pair):
 
             audit_text = (
                 f"✏️ Маълумот ўзгартирилди\n"
-                f"📂 Группа: {pair_name}\n"
                 f"🕒 Вақт: {now_text()}\n"
                 f"👤 Таҳрирлаган: {sender_name}\n\n"
                 f"🆕 Янги маълумот:\n{new_text}"
             )
-            await safe_call("edit audit send", client.send_message, archive_input, audit_text, reply_to=archive_message_id, pair_name=pair_name)
-            _runtime_stats["edits"] += 1
-            bump_stat(pair_name, "edit_count")
-            print(f"✅ [{pair_name}] Edited audit sent: {original_id}", flush=True)
+            await safe_call("edit_audit", client.send_message, archive_input, audit_text, reply_to=archive_message_id)
+            inc_counter("edit_audits", 1)
+            print(f"✅ Edited audit sent: {original_id}", flush=True)
         except Exception as e:
-            log_error(f"[{pair_name}] EDIT ERROR", e, pair_name=pair_name)
+            log_error("EDIT ERROR", e)
+        finally:
+            log_perf("edited_message", started)
 
-    client.add_event_handler(forward_message, events.NewMessage(chats=source_input))
+    client.add_event_handler(enqueue_new_message, events.NewMessage(chats=source_input))
     client.add_event_handler(edited_message, events.MessageEdited(chats=source_input))
-    asyncio.create_task(check_deleted_messages(pair_name, source_input, source_dialog_id, archive_input))
 
-    print(f"✅ [{pair_name}] Monitor active", flush=True)
-
-
-async def start_monitor_once():
-    await client.start()
-    init_db()
-
-    print("✅ Archive monitor PRO v2 started", flush=True)
-    print(f"✅ Monitoring pairs count: {len(MONITOR_PAIRS)}", flush=True)
-
-    for pair in MONITOR_PAIRS:
-        await setup_pair(pair)
-
-    print("✅ Ҳамма monitoring pair active. SOURCE группага янги хабар ташлаб текширинг.", flush=True)
+    # No delete-sync handler is registered by design.
+    runtime_state["status"] = "running"
+    print("✅ Monitor active. SOURCE группага янги хабар ташлаб текширинг.", flush=True)
     await client.run_until_disconnected()
 
-
+# ================= RECONNECT MANAGER =================
 async def main_forever():
+    threading.Thread(target=run_keep_alive_server, daemon=True).start()
     while True:
         try:
             await start_monitor_once()
         except FloodWaitError as e:
+            inc_counter("floodwaits", 1)
             wait_seconds = int(getattr(e, "seconds", 60)) + 2
             print(f"⏳ MAIN FLOODWAIT: waiting {wait_seconds}s", flush=True)
             await asyncio.sleep(wait_seconds)
         except Exception as e:
+            runtime_state["status"] = "reconnecting"
             log_error("MAIN CRASH - AUTO RECONNECT", e)
             traceback.print_exc()
             try:
                 await client.disconnect()
             except Exception:
                 pass
+            gc.collect()
             await asyncio.sleep(15)
             print("🔁 Reconnecting archive monitor...", flush=True)
-
 
 if __name__ == "__main__":
     with client:
