@@ -1,6 +1,9 @@
 import asyncio
+import os
 import sqlite3
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telethon import TelegramClient, events
 from telethon.tl.types import ChannelAdminLogEventActionDeleteMessage, Chat, Channel
@@ -15,6 +18,44 @@ SESSION_NAME = "archive_monitor"
 DB_NAME = "archive_map.db"
 
 client = TelegramClient(SESSION_NAME, api_id, api_hash)
+
+
+# ================= RENDER KEEP-ALIVE HTTP SERVER =================
+# Render Web Service порт очиқлигини шу блок орқали кўради.
+# UptimeRobot / ёки /health URL'ни 5 дақиқада бир марта чақирса, service ухлаб қолмайди.
+class HealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # UptimeRobot ping log'ларини кўпайтирмаслик учун.
+        return
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/ping"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Archive monitor is running")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+
+def run_keep_alive_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"✅ KEEP ALIVE SERVER STARTED ON PORT {port}", flush=True)
+    server.serve_forever()
+
+
+# Render портни тез кўриши учун Telegram clientдан олдин старт олади.
+threading.Thread(target=run_keep_alive_server, daemon=True).start()
 
 conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
