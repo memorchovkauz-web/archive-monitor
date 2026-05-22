@@ -721,7 +721,7 @@ async def start_monitor_once():
     runtime_state["source"] = str(getattr(source_entity, "title", SOURCE_GROUP))
     runtime_state["archive"] = str(getattr(archive_entity, "title", ARCHIVE_GROUP))
 
-    print("✅ Archive monitor PRO SAFE LIMIT started", flush=True)
+    print("✅ Archive monitor PRO SAFE LIMIT DELETE REPLY READY started", flush=True)
     print(f"✅ TASHKENT TIME NOW: {now_text()}", flush=True)
     print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
     print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
@@ -782,7 +782,10 @@ async def start_monitor_once():
             log_perf("edited_message", started)
 
     async def deleted_message(event):
-        """Send delete audit alert only. Archive copy is NOT deleted."""
+        """
+        Source group’dan xabar o‘chirilsa, archive group’dagi nusxa o‘chirilmaydi.
+        Archive’dagi original xabarga faqat qisqa reply audit yuboriladi.
+        """
         started = time.perf_counter()
         try:
             deleted_ids = list(getattr(event, "deleted_ids", []) or [])
@@ -791,27 +794,46 @@ async def start_monitor_once():
 
             for deleted_id in deleted_ids:
                 row = get_map_row(source_chat_id, deleted_id)
-                original_info = format_deleted_original(row)
-                audit_text = (
-                    f"🗑 Маълумот ўчирилди\n"
-                    f"🕒 Вақт: {now_text()}\n"
-                    f"👤 Ўчирган: Telegram delete event — аниқ user’ни Telegram API ҳар доим бермайди\n"
-                    f"🆔 Source msg_id: {deleted_id}\n\n"
-                    f"{original_info}\n\n"
-                    f"ℹ️ Архивдаги нусха ўчирилмади."
-                )
 
                 reply_to = row.get("archive_msg_id") if row else None
+
+                if row:
+                    person_name = row.get("sender_name") or "Номаълум"
+                    username = row.get("sender_username")
+                    if username:
+                        person_line = f"{person_name} (@{username})"
+                    else:
+                        person_line = person_name
+                else:
+                    person_line = "Номаълум"
+
+                # Qisqa professional reply alert. Archive nusxa o‘chirilmaydi.
+                audit_text = (
+                    "🗑 Маълумот ўчирилди\n"
+                    f"🕒 Вақт: {now_text()}\n"
+                    f"👤 Ўчирган: {person_line}"
+                )
+
                 await safe_telegram_pause("delete_audit")
+
                 if reply_to:
                     try:
-                        await safe_call("delete_audit", client.send_message, archive_input, audit_text, reply_to=reply_to)
-                    except Exception:
+                        await safe_call(
+                            "delete_audit_reply",
+                            client.send_message,
+                            archive_input,
+                            audit_text,
+                            reply_to=reply_to,
+                        )
+                    except Exception as e:
+                        log_error("DELETE AUDIT REPLY ERROR, FALLBACK TO NORMAL MESSAGE", e)
                         await safe_call("delete_audit_no_reply", client.send_message, archive_input, audit_text)
                 else:
                     await safe_call("delete_audit_no_map", client.send_message, archive_input, audit_text)
+
                 inc_counter("delete_audits", 1)
-                print(f"✅ Delete audit sent, archive copy kept: {deleted_id}", flush=True)
+                print(f"✅ Delete audit reply sent, archive copy kept: {deleted_id}", flush=True)
+
         except Exception as e:
             log_error("DELETE AUDIT ERROR", e)
         finally:
