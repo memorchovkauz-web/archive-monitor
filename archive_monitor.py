@@ -14,15 +14,31 @@ from telethon.tl.types import ChannelAdminLogEventActionDeleteMessage
 api_id = 36784553
 api_hash = "c463b506e987f1f82e211cef8c50f952"
 
-SOURCE_GROUP = -1003172289496
-ARCHIVE_GROUP = -5281572843
-ARCHIVE_TITLE_HINT = "Техника Архив"
+# 1 ta yoki ko'p gruppa monitoring uchun.
+# Hozir sizdagi ishlayotgan juftlik saqlab qolindi.
+# Keyin yangi gruppa qo'shish uchun shu listga yangi dict qo'shiladi.
+MONITOR_PAIRS = [
+    {
+        "name": "Техника",
+        "source_group": -1003172289496,
+        "archive_group": -5281572843,
+        "archive_title_hint": "Техника Архив",
+    },
+]
 
 SESSION_NAME = os.environ.get("SESSION_NAME", "archive_monitor")
 DB_NAME = os.environ.get("DB_NAME", "archive_map.db")
 
 client = TelegramClient(SESSION_NAME, api_id, api_hash)
 _db_lock = threading.Lock()
+_runtime_stats = {
+    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "forwarded": 0,
+    "duplicates": 0,
+    "edits": 0,
+    "delete_audits": 0,
+    "errors": 0,
+}
 
 
 # ================= RENDER KEEP-ALIVE HTTP SERVER =================
@@ -30,21 +46,32 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-    def _send_ok(self, body=b"OK"):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+    def _send(self, code=200, body=b"OK", content_type="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
     def do_GET(self):
         if self.path in ("/", "/health", "/ping"):
-            self._send_ok(b"Archive monitor is running")
+            self._send(200, b"Archive monitor is running")
+        elif self.path == "/stats":
+            body = (
+                "Archive monitor PRO v2\n"
+                f"started_at={_runtime_stats['started_at']}\n"
+                f"forwarded={_runtime_stats['forwarded']}\n"
+                f"duplicates={_runtime_stats['duplicates']}\n"
+                f"edits={_runtime_stats['edits']}\n"
+                f"delete_audits={_runtime_stats['delete_audits']}\n"
+                f"errors={_runtime_stats['errors']}\n"
+            ).encode("utf-8")
+            self._send(200, body)
         else:
-            self._send_ok(b"OK")
+            self._send(200, b"OK")
 
     def do_HEAD(self):
-        self._send_ok()
+        self._send(200, b"")
 
 
 def run_keep_alive_server():
@@ -78,6 +105,7 @@ def init_db():
                 source_msg_id INTEGER NOT NULL,
                 archive_chat_id INTEGER NOT NULL,
                 archive_msg_id INTEGER NOT NULL,
+                pair_name TEXT,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_msg_id)
             )
@@ -88,6 +116,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS processed_messages (
                 source_chat_id INTEGER NOT NULL,
                 source_msg_id INTEGER NOT NULL,
+                pair_name TEXT,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_msg_id)
             )
@@ -99,6 +128,7 @@ def init_db():
                 source_chat_id INTEGER NOT NULL,
                 source_msg_id INTEGER NOT NULL,
                 archive_msg_id INTEGER,
+                pair_name TEXT,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_msg_id)
@@ -115,6 +145,20 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS archive_stats (
+                day TEXT NOT NULL,
+                pair_name TEXT NOT NULL,
+                forwarded_count INTEGER NOT NULL DEFAULT 0,
+                duplicate_count INTEGER NOT NULL DEFAULT 0,
+                edit_count INTEGER NOT NULL DEFAULT 0,
+                delete_audit_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, pair_name)
+            )
+            """
+        )
         conn.commit()
 
 
@@ -122,7 +166,32 @@ def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log_error(place, error):
+def today_text():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def bump_stat(pair_name, column):
+    allowed = {"forwarded_count", "duplicate_count", "edit_count", "delete_audit_count", "error_count"}
+    if column not in allowed:
+        return
+    with _db_lock:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO archive_stats (day, pair_name)
+            VALUES (?, ?)
+            """,
+            (today_text(), pair_name),
+        )
+        conn.execute(
+            f"UPDATE archive_stats SET {column} = {column} + 1 WHERE day = ? AND pair_name = ?",
+            (today_text(), pair_name),
+        )
+        conn.commit()
+
+
+def log_error(place, error, pair_name="system"):
+    _runtime_stats["errors"] += 1
+    bump_stat(pair_name, "error_count")
     text = repr(error)
     print(f"❌ {place}: {text}", flush=True)
     with _db_lock:
@@ -133,23 +202,23 @@ def log_error(place, error):
         conn.commit()
 
 
-def save_map(source_chat_id, source_msg_id, archive_chat_id, archive_msg_id):
+def save_map(pair_name, source_chat_id, source_msg_id, archive_chat_id, archive_msg_id):
     with _db_lock:
         conn.execute(
             """
             INSERT OR REPLACE INTO message_map
-            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, pair_name, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, now_text()),
+            (source_chat_id, source_msg_id, archive_chat_id, archive_msg_id, pair_name, now_text()),
         )
         conn.execute(
             """
             INSERT OR IGNORE INTO processed_messages
-            (source_chat_id, source_msg_id, created_at)
-            VALUES (?, ?, ?)
+            (source_chat_id, source_msg_id, pair_name, created_at)
+            VALUES (?, ?, ?, ?)
             """,
-            (source_chat_id, source_msg_id, now_text()),
+            (source_chat_id, source_msg_id, pair_name, now_text()),
         )
         conn.commit()
 
@@ -172,21 +241,21 @@ def is_processed(source_chat_id, source_msg_id):
     return row is not None
 
 
-def save_delete_audit(source_chat_id, source_msg_id, archive_msg_id, status):
+def save_delete_audit(pair_name, source_chat_id, source_msg_id, archive_msg_id, status):
     with _db_lock:
         conn.execute(
             """
             INSERT OR REPLACE INTO delete_audit
-            (source_chat_id, source_msg_id, archive_msg_id, created_at, status)
-            VALUES (?, ?, ?, ?, ?)
+            (source_chat_id, source_msg_id, archive_msg_id, pair_name, created_at, status)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (source_chat_id, source_msg_id, archive_msg_id, now_text(), status),
+            (source_chat_id, source_msg_id, archive_msg_id, pair_name, now_text(), status),
         )
         conn.commit()
 
 
 # ================= SAFE TELEGRAM HELPERS =================
-async def safe_call(place, func, *args, retries=3, **kwargs):
+async def safe_call(place, func, *args, retries=3, pair_name="system", **kwargs):
     for attempt in range(1, retries + 1):
         try:
             return await func(*args, **kwargs)
@@ -195,12 +264,12 @@ async def safe_call(place, func, *args, retries=3, **kwargs):
             print(f"⏳ FLOODWAIT at {place}: waiting {wait_seconds}s", flush=True)
             await asyncio.sleep(wait_seconds)
         except (ConnectionError, TimeoutError, RPCError) as e:
-            log_error(f"{place} attempt {attempt}/{retries}", e)
+            log_error(f"{place} attempt {attempt}/{retries}", e, pair_name=pair_name)
             if attempt == retries:
                 raise
             await asyncio.sleep(min(5 * attempt, 30))
         except Exception as e:
-            log_error(f"{place} attempt {attempt}/{retries}", e)
+            log_error(f"{place} attempt {attempt}/{retries}", e, pair_name=pair_name)
             if attempt == retries:
                 raise
             await asyncio.sleep(min(5 * attempt, 30))
@@ -218,7 +287,7 @@ def sender_name_from_user(user):
     return name
 
 
-async def find_dialog_by_id_or_title(group_id, title_hint=None):
+async def find_dialog_by_id_or_title(group_id, title_hint=None, pair_name="system"):
     found_dialog = None
 
     async for dialog in client.iter_dialogs(limit=None):
@@ -235,38 +304,38 @@ async def find_dialog_by_id_or_title(group_id, title_hint=None):
     entity = found_dialog.entity
     input_entity = found_dialog.input_entity
 
-    print(f"✅ Dialog топилди: {found_dialog.name} | dialog_id={found_dialog.id}", flush=True)
+    print(f"✅ [{pair_name}] Dialog топилди: {found_dialog.name} | dialog_id={found_dialog.id}", flush=True)
     print(f"   entity_type={type(entity).__name__} | input_type={type(input_entity).__name__}", flush=True)
 
     migrated_to = getattr(entity, "migrated_to", None)
     if migrated_to:
-        print("🔁 Эски Chat supergroup/channel га migrate бўлган. Янги peer ишлатилади.", flush=True)
-        migrated_entity = await safe_call("get migrated entity", client.get_entity, migrated_to)
-        migrated_input_entity = await safe_call("get migrated input", client.get_input_entity, migrated_entity)
+        print(f"🔁 [{pair_name}] Эски Chat supergroup/channel га migrate бўлган. Янги peer ишлатилади.", flush=True)
+        migrated_entity = await safe_call("get migrated entity", client.get_entity, migrated_to, pair_name=pair_name)
+        migrated_input_entity = await safe_call("get migrated input", client.get_input_entity, migrated_entity, pair_name=pair_name)
         print(
-            f"✅ MIGRATED TARGET: {getattr(migrated_entity, 'title', 'unknown')} | "
+            f"✅ [{pair_name}] MIGRATED TARGET: {getattr(migrated_entity, 'title', 'unknown')} | "
             f"id={getattr(migrated_entity, 'id', None)} | input_type={type(migrated_input_entity).__name__}",
             flush=True,
         )
-        return migrated_input_entity, migrated_entity, found_dialog
+        return migrated_input_entity, migrated_entity, found_dialog.id
 
-    return input_entity, entity, found_dialog
+    return input_entity, entity, found_dialog.id
 
 
-async def verify_can_send(archive_input):
-    test_text = "✅ Archive monitor PRO test: archive peer ишлаяпти"
-    msg = await safe_call("archive test send", client.send_message, archive_input, test_text)
-    print(f"✅ ARCHIVE TEST SEND OK: msg_id={msg.id}", flush=True)
+async def verify_can_send(pair_name, archive_input):
+    test_text = f"✅ Archive monitor PRO v2 test: {pair_name} archive peer ишлаяпти"
+    msg = await safe_call("archive test send", client.send_message, archive_input, test_text, pair_name=pair_name)
+    print(f"✅ [{pair_name}] ARCHIVE TEST SEND OK: msg_id={msg.id}", flush=True)
     try:
-        await safe_call("archive test delete", client.delete_messages, archive_input, [msg.id])
-        print("✅ ARCHIVE TEST MESSAGE DELETED", flush=True)
+        await safe_call("archive test delete", client.delete_messages, archive_input, [msg.id], pair_name=pair_name)
+        print(f"✅ [{pair_name}] ARCHIVE TEST MESSAGE DELETED", flush=True)
     except Exception as e:
-        print(f"⚠️ Test хабарни ўчира олмадим, лекин юбориш ишлади: {e!r}", flush=True)
+        print(f"⚠️ [{pair_name}] Test хабарни ўчира олмадим, лекин юбориш ишлади: {e!r}", flush=True)
     return True
 
 
 # ================= MONITOR LOGIC =================
-async def check_deleted_messages(source_input, source_chat_id, archive_input):
+async def check_deleted_messages(pair_name, source_input, source_chat_id, archive_input):
     while True:
         try:
             async for log_event in client.iter_admin_log(source_input, delete=True, limit=50):
@@ -286,8 +355,8 @@ async def check_deleted_messages(source_input, source_chat_id, archive_input):
 
                 archive_message_id = get_archive_msg_id(source_chat_id, source_msg_id)
                 if not archive_message_id:
-                    print(f"DELETE SKIPPED, mapping not found: {source_msg_id}", flush=True)
-                    save_delete_audit(source_chat_id, source_msg_id, None, "mapping_not_found")
+                    print(f"[{pair_name}] DELETE SKIPPED, mapping not found: {source_msg_id}", flush=True)
+                    save_delete_audit(pair_name, source_chat_id, source_msg_id, None, "mapping_not_found")
                     continue
 
                 user_name = sender_name_from_user(log_event.user)
@@ -296,60 +365,69 @@ async def check_deleted_messages(source_input, source_chat_id, archive_input):
                     client.send_message,
                     archive_input,
                     f"🗑 Маълумот ўчирилди\n"
+                    f"📂 Группа: {pair_name}\n"
                     f"🕒 Вақт: {now_text()}\n"
                     f"👤 Ўчирган: {user_name}",
                     reply_to=archive_message_id,
+                    pair_name=pair_name,
                 )
-                save_delete_audit(source_chat_id, source_msg_id, archive_message_id, "audit_sent")
-                print(f"✅ Deleted audit sent: {source_msg_id}", flush=True)
+                save_delete_audit(pair_name, source_chat_id, source_msg_id, archive_message_id, "audit_sent")
+                _runtime_stats["delete_audits"] += 1
+                bump_stat(pair_name, "delete_audit_count")
+                print(f"✅ [{pair_name}] Deleted audit sent: {source_msg_id}", flush=True)
 
         except FloodWaitError as e:
             wait_seconds = int(getattr(e, "seconds", 30)) + 2
-            print(f"⏳ DELETE FLOODWAIT: waiting {wait_seconds}s", flush=True)
+            print(f"⏳ [{pair_name}] DELETE FLOODWAIT: waiting {wait_seconds}s", flush=True)
             await asyncio.sleep(wait_seconds)
         except Exception as e:
-            log_error("DELETE LOOP ERROR", e)
+            log_error(f"[{pair_name}] DELETE LOOP ERROR", e, pair_name=pair_name)
             await asyncio.sleep(10)
 
         await asyncio.sleep(5)
 
 
-async def start_monitor_once():
-    await client.start()
-    init_db()
+async def setup_pair(pair):
+    pair_name = pair["name"]
+    source_input, source_entity, source_dialog_id = await find_dialog_by_id_or_title(
+        pair["source_group"], pair_name=pair_name
+    )
+    archive_input, archive_entity, archive_dialog_id = await find_dialog_by_id_or_title(
+        pair["archive_group"], title_hint=pair.get("archive_title_hint"), pair_name=pair_name
+    )
 
-    source_input, source_entity, _ = await find_dialog_by_id_or_title(SOURCE_GROUP)
-    archive_input, archive_entity, _ = await find_dialog_by_id_or_title(ARCHIVE_GROUP, title_hint=ARCHIVE_TITLE_HINT)
+    await verify_can_send(pair_name, archive_input)
 
-    source_chat_id = SOURCE_GROUP
-    archive_chat_id = ARCHIVE_GROUP
-
-    print("✅ Archive monitor PRO started", flush=True)
-    print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
-    print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
-
-    await verify_can_send(archive_input)
-
-    async def forward_message(event):
+    async def forward_message(event, pair_name=pair_name, source_chat_id=source_dialog_id, archive_chat_id=archive_dialog_id, archive_input=archive_input):
         try:
             source_msg_id = event.message.id
             if is_processed(source_chat_id, source_msg_id):
-                print(f"♻️ DUPLICATE SKIPPED: {source_msg_id}", flush=True)
+                _runtime_stats["duplicates"] += 1
+                bump_stat(pair_name, "duplicate_count")
+                print(f"♻️ [{pair_name}] DUPLICATE SKIPPED: {source_msg_id}", flush=True)
                 return
 
-            forwarded = await safe_call("forward message", client.forward_messages, archive_input, event.message)
+            forwarded = await safe_call(
+                "forward message",
+                client.forward_messages,
+                archive_input,
+                event.message,
+                pair_name=pair_name,
+            )
             forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
-            save_map(source_chat_id, source_msg_id, archive_chat_id, forwarded_msg.id)
-            print(f"✅ FORWARDED AND MAPPED: {source_msg_id} -> {forwarded_msg.id}", flush=True)
+            save_map(pair_name, source_chat_id, source_msg_id, archive_chat_id, forwarded_msg.id)
+            _runtime_stats["forwarded"] += 1
+            bump_stat(pair_name, "forwarded_count")
+            print(f"✅ [{pair_name}] FORWARDED AND MAPPED: {source_msg_id} -> {forwarded_msg.id}", flush=True)
         except Exception as e:
-            log_error("FORWARD ERROR", e)
+            log_error(f"[{pair_name}] FORWARD ERROR", e, pair_name=pair_name)
 
-    async def edited_message(event):
+    async def edited_message(event, pair_name=pair_name, source_chat_id=source_dialog_id, archive_input=archive_input):
         try:
             original_id = event.message.id
             archive_message_id = get_archive_msg_id(source_chat_id, original_id)
             if not archive_message_id:
-                print(f"EDIT SKIPPED, mapping not found: {original_id}", flush=True)
+                print(f"[{pair_name}] EDIT SKIPPED, mapping not found: {original_id}", flush=True)
                 return
 
             sender = await event.get_sender()
@@ -360,20 +438,36 @@ async def start_monitor_once():
 
             audit_text = (
                 f"✏️ Маълумот ўзгартирилди\n"
+                f"📂 Группа: {pair_name}\n"
                 f"🕒 Вақт: {now_text()}\n"
                 f"👤 Таҳрирлаган: {sender_name}\n\n"
                 f"🆕 Янги маълумот:\n{new_text}"
             )
-            await safe_call("edit audit send", client.send_message, archive_input, audit_text, reply_to=archive_message_id)
-            print(f"✅ Edited audit sent: {original_id}", flush=True)
+            await safe_call("edit audit send", client.send_message, archive_input, audit_text, reply_to=archive_message_id, pair_name=pair_name)
+            _runtime_stats["edits"] += 1
+            bump_stat(pair_name, "edit_count")
+            print(f"✅ [{pair_name}] Edited audit sent: {original_id}", flush=True)
         except Exception as e:
-            log_error("EDIT ERROR", e)
+            log_error(f"[{pair_name}] EDIT ERROR", e, pair_name=pair_name)
 
     client.add_event_handler(forward_message, events.NewMessage(chats=source_input))
     client.add_event_handler(edited_message, events.MessageEdited(chats=source_input))
-    asyncio.create_task(check_deleted_messages(source_input, source_chat_id, archive_input))
+    asyncio.create_task(check_deleted_messages(pair_name, source_input, source_dialog_id, archive_input))
 
-    print("✅ Monitor active. SOURCE группага янги хабар ташлаб текширинг.", flush=True)
+    print(f"✅ [{pair_name}] Monitor active", flush=True)
+
+
+async def start_monitor_once():
+    await client.start()
+    init_db()
+
+    print("✅ Archive monitor PRO v2 started", flush=True)
+    print(f"✅ Monitoring pairs count: {len(MONITOR_PAIRS)}", flush=True)
+
+    for pair in MONITOR_PAIRS:
+        await setup_pair(pair)
+
+    print("✅ Ҳамма monitoring pair active. SOURCE группага янги хабар ташлаб текширинг.", flush=True)
     await client.run_until_disconnected()
 
 
