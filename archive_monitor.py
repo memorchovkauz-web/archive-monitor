@@ -6,8 +6,7 @@ import sqlite3
 import threading
 import time
 import traceback
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telethon import TelegramClient, events
@@ -25,7 +24,7 @@ SESSION_NAME = os.environ.get("SESSION_NAME", "archive_monitor")
 DB_NAME = os.environ.get("DB_NAME", "archive_map.db")
 QUEUE_WORKERS = int(os.environ.get("QUEUE_WORKERS", "2"))
 QUEUE_MAXSIZE = int(os.environ.get("QUEUE_MAXSIZE", "5000"))
-LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TZ", "Asia/Tashkent"))
+TASHKENT_TZ = timezone(timedelta(hours=5), name="Asia/Tashkent")
 
 # IMPORTANT: archive group messages will NOT be deleted if source messages are deleted.
 DELETE_SYNC_ENABLED = False
@@ -58,7 +57,17 @@ conn = db_connect()
 
 
 def now_text():
-    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    # Render server UTC bo‘lsa ham doim O‘zbekiston vaqti (UTC+5) qaytadi.
+    return datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def tg_time_text(dt):
+    # Telegram message.date odatda UTC bo‘ladi. Uni Tashkent vaqtiga majburiy o‘giramiz.
+    if not dt:
+        return now_text()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(TASHKENT_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db():
@@ -242,6 +251,8 @@ def get_stats():
         "source_group": SOURCE_GROUP,
         "archive_group": ARCHIVE_GROUP,
         "delete_sync_enabled": DELETE_SYNC_ENABLED,
+        "time_zone": "Asia/Tashkent UTC+5",
+        "server_time_tashkent": now_text(),
         "total_archived": total_archived,
         "duplicates_blocked": get_counter("duplicates_blocked"),
         "queued_messages": get_counter("queued_messages"),
@@ -416,10 +427,12 @@ async def start_monitor_once():
     runtime_state["source"] = str(getattr(source_entity, "title", SOURCE_GROUP))
     runtime_state["archive"] = str(getattr(archive_entity, "title", ARCHIVE_GROUP))
 
-    print("✅ Archive monitor STABILITY ONLY started", flush=True)
+    print("✅ Archive monitor STABILITY ONLY TASHKENT FIXED started", flush=True)
+    print(f"✅ TASHKENT TIME NOW: {now_text()}", flush=True)
     print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
     print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
     print("ℹ️ DELETE SYNC: OFF — асосий гуруҳдан ўчса ҳам архивдан ўчмайди", flush=True)
+    print("ℹ️ TIME MODE: FORCE Asia/Tashkent UTC+5", flush=True)
 
     await verify_can_send(archive_input)
 
