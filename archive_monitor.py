@@ -54,6 +54,9 @@ runtime_state = {
     "last_safe_pause_at": None,
 }
 
+
+_registered_handlers = []
+
 # ================= SQLITE DATABASE =================
 def db_connect():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
@@ -157,6 +160,19 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                source_chat_id INTEGER NOT NULL,
+                source_msg_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (source_chat_id, source_msg_id, event_type, content_hash)
+            )
+            """
+        )
+
 
         # Safe migrations for older SQLite files already created on Render.
         for col_name, col_type in (
@@ -178,6 +194,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_created ON performance_log (created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_media_type_seen ON media_fingerprints (media_type, first_seen_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_media_source ON media_fingerprints (source_chat_id, source_msg_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events (created_at)")
         conn.commit()
 
 
@@ -425,6 +442,58 @@ def is_processed(source_chat_id, source_msg_id):
     return row is not None
 
 
+
+
+def claim_source_message(source_chat_id, source_msg_id):
+    """Atomic anti-duplicate claim.
+    Message is marked before queueing, so multiple handlers/workers cannot forward it twice.
+    """
+    with _db_lock:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO processed_messages
+            (source_chat_id, source_msg_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (source_chat_id, source_msg_id, now_text()),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def release_source_message_claim(source_chat_id, source_msg_id):
+    """Release claim only when forward failed before mapping was saved."""
+    with _db_lock:
+        has_map = conn.execute(
+            "SELECT 1 FROM message_map WHERE source_chat_id = ? AND source_msg_id = ?",
+            (source_chat_id, source_msg_id),
+        ).fetchone()
+        if not has_map:
+            conn.execute(
+                "DELETE FROM processed_messages WHERE source_chat_id = ? AND source_msg_id = ?",
+                (source_chat_id, source_msg_id),
+            )
+            conn.commit()
+
+
+def claim_audit_event(source_chat_id, source_msg_id, event_type, content_hash):
+    """Prevents repeated edit/delete audit messages for the same exact event."""
+    with _db_lock:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO audit_events
+            (source_chat_id, source_msg_id, event_type, content_hash, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (source_chat_id, source_msg_id, event_type, content_hash, now_text()),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def short_hash(value):
+    return hashlib.sha256(str(value).encode("utf-8", errors="ignore")).hexdigest()
+
 def get_stats():
     with _db_lock:
         total_archived = conn.execute("SELECT COUNT(*) FROM message_map").fetchone()[0]
@@ -608,15 +677,10 @@ async def find_dialog_by_id_or_title(group_id, title_hint=None):
 
 
 async def verify_can_send(archive_input):
-    test_text = "✅ Archive monitor PRO SAFE LIMIT test: archive peer ишлаяпти"
-    await safe_telegram_pause("archive_test_send")
-    msg = await safe_call("archive_test_send", client.send_message, archive_input, test_text)
-    print(f"✅ ARCHIVE TEST SEND OK: msg_id={msg.id}", flush=True)
-    try:
-        await safe_call("archive_test_delete", client.delete_messages, archive_input, [msg.id])
-        print("✅ ARCHIVE TEST MESSAGE DELETED", flush=True)
-    except Exception as e:
-        print(f"⚠️ Test хабарни ўчира олмадим, лекин юбориш ишлади: {e!r}", flush=True)
+    # Startup test message is intentionally disabled.
+    # Old versions sent "Archive monitor PRO SAFE LIMIT test" into archive group on every deploy/reconnect.
+    # That caused confusion and could trigger extra audit messages.
+    print("✅ ARCHIVE PEER RESOLVED: startup test message disabled", flush=True)
     return True
 
 # ================= ARCHIVE QUEUE / ASYNC WORKERS =================
@@ -630,10 +694,6 @@ async def archive_worker(worker_id, archive_input, archive_chat_id, source_chat_
             source_msg_id = msg.id
             media_type = media_type_from_message(msg)
 
-            if is_processed(source_chat_id, source_msg_id):
-                inc_counter("duplicates_blocked", 1)
-                print(f"♻️ DUPLICATE SKIPPED: {source_msg_id}", flush=True)
-                continue
 
             sender = await event.get_sender()
             sender_name = sender_name_from_user(sender)
@@ -695,6 +755,10 @@ async def archive_worker(worker_id, archive_input, archive_chat_id, source_chat_
 
         except Exception as e:
             inc_counter("forward_errors", 1)
+            try:
+                release_source_message_claim(source_chat_id, source_msg_id)
+            except Exception:
+                pass
             log_error(f"WORKER {worker_id} FORWARD ERROR", e)
         finally:
             log_perf("worker_total", started)
@@ -721,7 +785,7 @@ async def start_monitor_once():
     runtime_state["source"] = str(getattr(source_entity, "title", SOURCE_GROUP))
     runtime_state["archive"] = str(getattr(archive_entity, "title", ARCHIVE_GROUP))
 
-    print("✅ Archive monitor PRO SAFE LIMIT DELETE REPLY READY started", flush=True)
+    print("✅ Archive monitor PRO SAFE LIMIT NO DUPLICATE started", flush=True)
     print(f"✅ TASHKENT TIME NOW: {now_text()}", flush=True)
     print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
     print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
@@ -739,7 +803,7 @@ async def start_monitor_once():
         try:
             runtime_state["last_event_at"] = now_text()
             source_msg_id = event.message.id
-            if is_processed(source_chat_id, source_msg_id):
+            if not claim_source_message(source_chat_id, source_msg_id):
                 inc_counter("duplicates_blocked", 1)
                 print(f"♻️ DUPLICATE BEFORE QUEUE SKIPPED: {source_msg_id}", flush=True)
                 return
@@ -765,6 +829,11 @@ async def start_monitor_once():
             new_text = event.message.message or event.message.text or event.message.raw_text or ""
             if not new_text:
                 new_text = "Матнсиз media/caption ўзгартирилган"
+
+            audit_hash = short_hash(new_text)
+            if not claim_audit_event(source_chat_id, original_id, "edit", audit_hash):
+                print(f"♻️ DUPLICATE EDIT AUDIT SKIPPED: {original_id}", flush=True)
+                return
 
             audit_text = (
                 f"✏️ Маълумот ўзгартирилди\n"
@@ -807,6 +876,11 @@ async def start_monitor_once():
                 else:
                     person_line = "Номаълум"
 
+                delete_hash = short_hash(f"delete:{deleted_id}")
+                if not claim_audit_event(source_chat_id, deleted_id, "delete", delete_hash):
+                    print(f"♻️ DUPLICATE DELETE AUDIT SKIPPED: {deleted_id}", flush=True)
+                    continue
+
                 # Qisqa professional reply alert. Archive nusxa o‘chirilmaydi.
                 audit_text = (
                     "🗑 Маълумот ўчирилди\n"
@@ -839,9 +913,27 @@ async def start_monitor_once():
         finally:
             log_perf("deleted_message", started)
 
-    client.add_event_handler(enqueue_new_message, events.NewMessage(chats=source_input))
-    client.add_event_handler(edited_message, events.MessageEdited(chats=source_input))
-    client.add_event_handler(deleted_message, events.MessageDeleted(chats=source_input))
+    global _registered_handlers
+    # Reconnect paytida eski handlerlar qolib ketmasin. Aks holda bitta edit/delete bir necha marta keladi.
+    for handler, event_builder in list(_registered_handlers):
+        try:
+            client.remove_event_handler(handler, event_builder)
+        except Exception:
+            pass
+    _registered_handlers = []
+
+    new_builder = events.NewMessage(chats=source_input)
+    edit_builder = events.MessageEdited(chats=source_input)
+    delete_builder = events.MessageDeleted(chats=source_input)
+
+    client.add_event_handler(enqueue_new_message, new_builder)
+    client.add_event_handler(edited_message, edit_builder)
+    client.add_event_handler(deleted_message, delete_builder)
+    _registered_handlers.extend([
+        (enqueue_new_message, new_builder),
+        (edited_message, edit_builder),
+        (deleted_message, delete_builder),
+    ])
 
     # Delete-sync is OFF by design: source delete => archive copy stays, only audit alert is sent.
     runtime_state["status"] = "running"
