@@ -643,6 +643,70 @@ def sender_name_from_user(user):
     return f"{name} (@{username})" if username else name
 
 
+def user_line_clean(user):
+    """Фойдаланувчи исм-фамилияси ва username'ни ник такрорланмасдан қайтаради."""
+    if not user:
+        return "Номаълум"
+
+    first = getattr(user, "first_name", None) or ""
+    last = getattr(user, "last_name", None) or ""
+    username = getattr(user, "username", None) or ""
+
+    full_name = f"{first} {last}".strip() or "Номаълум"
+    if username:
+        username_part = f"@{username}"
+        if username_part not in full_name:
+            return f"{full_name} ({username_part})"
+    return full_name
+
+
+def get_deleted_message_from_admin_log_action(action):
+    """Telethon admin log delete action ichidan o‘chirilgan Message obyektini xavfsiz oladi."""
+    if not action:
+        return None
+    for attr in ("message", "deleted_message", "old", "prev_message"):
+        msg = getattr(action, attr, None)
+        if msg is not None and hasattr(msg, "id"):
+            return msg
+    return None
+
+
+async def get_deleter_line(client, source_entity, delete_event, deleted_msg_id):
+    """
+    Delete alert uchun AYNAN o‘chirgan odamni topishga urinadi.
+
+    Muhim: oddiy Telegram delete update ko‘pincha deleter user_id bermaydi.
+    Shuning uchun professional yechim: supergroup admin log’dan oxirgi delete eventlarni tekshirish.
+    Agar akkaунт admin bo‘lmasa yoki admin log ma’lumot bermasa, 'Номаълум' qaytariladi.
+    Hеч қachon xabar yozgan odamni 'o‘chirgan' deb ko‘rsatmaydi.
+    """
+    # 1) Ba'zi update turlarida user_id bo‘lishi mumkin — avval shuni sinaymiz.
+    try:
+        original_update = getattr(delete_event, "original_update", None)
+        user_id = getattr(original_update, "user_id", None)
+        if user_id:
+            user = await client.get_entity(user_id)
+            return user_line_clean(user)
+    except Exception:
+        pass
+
+    # 2) Supergroup/channel admin log orqali aniqlash.
+    try:
+        async for log_event in client.iter_admin_log(source_entity, delete=True, limit=50):
+            action = getattr(log_event, "action", None)
+            deleted_message = get_deleted_message_from_admin_log_action(action)
+            if deleted_message is not None and getattr(deleted_message, "id", None) == deleted_msg_id:
+                user = getattr(log_event, "user", None)
+                if user is None:
+                    user_id = getattr(log_event, "user_id", None)
+                    user = await client.get_entity(user_id) if user_id else None
+                return user_line_clean(user)
+    except Exception as e:
+        log_error("ADMIN LOG DELETER LOOKUP ERROR", e)
+
+    return "Номаълум"
+
+
 async def find_dialog_by_id_or_title(group_id, title_hint=None):
     found_dialog = None
     async for dialog in client.iter_dialogs(limit=None):
@@ -785,7 +849,7 @@ async def start_monitor_once():
     runtime_state["source"] = str(getattr(source_entity, "title", SOURCE_GROUP))
     runtime_state["archive"] = str(getattr(archive_entity, "title", ARCHIVE_GROUP))
 
-    print("✅ Archive monitor PRO SAFE LIMIT NO DUPLICATE started", flush=True)
+    print("✅ Archive monitor DELETE DELETER FIXED started", flush=True)
     print(f"✅ TASHKENT TIME NOW: {now_text()}", flush=True)
     print(f"✅ SOURCE input: {type(source_input).__name__}", flush=True)
     print(f"✅ ARCHIVE input: {type(archive_input).__name__}", flush=True)
@@ -866,15 +930,9 @@ async def start_monitor_once():
 
                 reply_to = row.get("archive_msg_id") if row else None
 
-                if row:
-                    person_name = row.get("sender_name") or "Номаълум"
-                    username = row.get("sender_username")
-                    if username:
-                        person_line = f"{person_name} (@{username})"
-                    else:
-                        person_line = person_name
-                else:
-                    person_line = "Номаълум"
+                # AYNAN o‘chirgan odamni aniqlaymiz.
+                # Muhim: sender_name ishlatilmaydi, chunki u xabarni yozgan odam bo‘lishi mumkin.
+                person_line = await get_deleter_line(client, source_entity, event, deleted_id)
 
                 delete_hash = short_hash(f"delete:{deleted_id}")
                 if not claim_audit_event(source_chat_id, deleted_id, "delete", delete_hash):
